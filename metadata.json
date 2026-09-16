@@ -1,0 +1,6 @@
+{
+  "name": "Nudge",
+  "description": "Secure AI student companion with Edge Function proxy architecture, live Supabase context snapshot, on-device local chat history, and calendar event extraction.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
