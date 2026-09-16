@@ -41,13 +41,14 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     onEnd,
   } = options;
 
+  const [isStarting, setIsStarting] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSupported, setIsSupported] = useState(true);
-  const [audioLevel, setAudioLevel] = useState(0); // 0 to 100 volume level
+  const [audioLevel, setAudioLevel] = useState(0);
   const [frequencyBars, setFrequencyBars] = useState<number[]>([8, 12, 18, 24, 18, 22, 14, 8]);
   const [permissionDenied, setPermissionDenied] = useState(false);
 
@@ -57,6 +58,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
   const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const fallbackIntervalRef = useRef<number | null>(null);
 
   const accumulatedTranscriptRef = useRef("");
   const onEndCallbackRef = useRef(onEnd);
@@ -76,6 +78,10 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
+    }
+    if (fallbackIntervalRef.current) {
+      clearInterval(fallbackIntervalRef.current);
+      fallbackIntervalRef.current = null;
     }
     if (audioContextRef.current && audioContextRef.current.state !== "closed") {
       try {
@@ -120,12 +126,14 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     }
 
     setIsListening(false);
+    setIsStarting(false);
   }, [stopAudioAnalyser]);
 
   const startListening = useCallback(async () => {
     if (typeof window === "undefined") return;
 
     cleanup();
+    setIsStarting(true);
     setError(null);
     setPermissionDenied(false);
     setTranscript("");
@@ -133,21 +141,101 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     accumulatedTranscriptRef.current = "";
     audioChunksRef.current = [];
 
-    // 1. Acquire real microphone stream
-    let stream: MediaStream | null = null;
+    let streamObtained = false;
+    let speechApiStarted = false;
+
+    // 1. Attempt standard MediaDevices getUserMedia
     try {
       if (navigator?.mediaDevices?.getUserMedia) {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
+        // Use basic { audio: true } for maximum browser & hardware compatibility
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaStreamRef.current = stream;
+        streamObtained = true;
+
+        // Set up Web Audio Analyser
+        try {
+          const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+          if (AudioCtx) {
+            const audioCtx = new AudioCtx();
+            if (audioCtx.state === "suspended") {
+              await audioCtx.resume();
+            }
+            audioContextRef.current = audioCtx;
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 64;
+            analyser.smoothingTimeConstant = 0.6;
+
+            const source = audioCtx.createMediaStreamSource(stream);
+            source.connect(analyser);
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            const updateVolume = () => {
+              if (!analyser) return;
+              analyser.getByteFrequencyData(dataArray);
+
+              let sum = 0;
+              for (let i = 0; i < dataArray.length; i++) {
+                sum += dataArray[i];
+              }
+              const avg = Math.min(100, Math.round((sum / dataArray.length) * 1.5));
+              setAudioLevel(avg);
+
+              const bars = [
+                Math.max(6, Math.min(36, Math.round(dataArray[1] / 6))),
+                Math.max(8, Math.min(38, Math.round(dataArray[3] / 5.5))),
+                Math.max(10, Math.min(42, Math.round(dataArray[5] / 5))),
+                Math.max(12, Math.min(46, Math.round(dataArray[7] / 4.5))),
+                Math.max(10, Math.min(44, Math.round(dataArray[9] / 5))),
+                Math.max(8, Math.min(40, Math.round(dataArray[11] / 5.5))),
+                Math.max(6, Math.min(34, Math.round(dataArray[13] / 6.5))),
+                Math.max(6, Math.min(30, Math.round(dataArray[15] / 7))),
+              ];
+              setFrequencyBars(bars);
+
+              animationFrameRef.current = requestAnimationFrame(updateVolume);
+            };
+
+            animationFrameRef.current = requestAnimationFrame(updateVolume);
+          }
+        } catch (analyserErr) {
+          console.warn("AudioContext setup warning:", analyserErr);
+        }
+
+        // Initialize MediaRecorder for server-side Gemini fallback
+        try {
+          let selectedMime = "";
+          const candidateMimes = [
+            "audio/webm;codecs=opus",
+            "audio/webm",
+            "audio/mp4",
+            "audio/ogg",
+          ];
+          for (const m of candidateMimes) {
+            if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+              selectedMime = m;
+              break;
+            }
+          }
+
+          const recorder = selectedMime
+            ? new MediaRecorder(stream, { mimeType: selectedMime })
+            : new MediaRecorder(stream);
+
+          recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+              audioChunksRef.current.push(event.data);
+            }
+          };
+
+          recorder.start(250);
+          mediaRecorderRef.current = recorder;
+        } catch (recErr) {
+          console.warn("MediaRecorder start warning:", recErr);
+        }
       }
     } catch (err: any) {
-      console.warn("getUserMedia error:", err);
+      console.warn("getUserMedia failed or restricted:", err);
       const isDenied =
         err?.name === "NotAllowedError" ||
         err?.name === "PermissionDeniedError" ||
@@ -155,100 +243,10 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
         String(err).includes("dismissed");
       if (isDenied) {
         setPermissionDenied(true);
-        setError("Microphone permission was denied. Please allow microphone access in your browser to speak.");
-      } else {
-        setError("Could not access microphone. Please check your audio input settings.");
-      }
-      setIsListening(false);
-      return;
-    }
-
-    setIsListening(true);
-
-    // 2. Set up live audio analyser for real-time waveform bounce
-    if (stream) {
-      try {
-        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-        if (AudioCtx) {
-          const audioCtx = new AudioCtx();
-          audioContextRef.current = audioCtx;
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 64;
-          analyser.smoothingTimeConstant = 0.6;
-
-          const source = audioCtx.createMediaStreamSource(stream);
-          source.connect(analyser);
-
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-          const updateVolume = () => {
-            if (!analyser) return;
-            analyser.getByteFrequencyData(dataArray);
-
-            // Compute average level (0-100)
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-              sum += dataArray[i];
-            }
-            const avg = Math.min(100, Math.round((sum / dataArray.length) * 1.5));
-            setAudioLevel(avg);
-
-            // Extract 8 representative bars
-            const bars = [
-              Math.max(6, Math.min(36, Math.round(dataArray[1] / 6))),
-              Math.max(8, Math.min(38, Math.round(dataArray[3] / 5.5))),
-              Math.max(10, Math.min(42, Math.round(dataArray[5] / 5))),
-              Math.max(12, Math.min(46, Math.round(dataArray[7] / 4.5))),
-              Math.max(10, Math.min(44, Math.round(dataArray[9] / 5))),
-              Math.max(8, Math.min(40, Math.round(dataArray[11] / 5.5))),
-              Math.max(6, Math.min(34, Math.round(dataArray[13] / 6.5))),
-              Math.max(6, Math.min(30, Math.round(dataArray[15] / 7))),
-            ];
-            setFrequencyBars(bars);
-
-            animationFrameRef.current = requestAnimationFrame(updateVolume);
-          };
-
-          animationFrameRef.current = requestAnimationFrame(updateVolume);
-        }
-      } catch (analyserErr) {
-        console.warn("Web Audio Analyser setup error:", analyserErr);
-      }
-
-      // 3. Initialize MediaRecorder for server-side Gemini transcription fallback
-      try {
-        let selectedMime = "";
-        const candidateMimes = [
-          "audio/webm;codecs=opus",
-          "audio/webm",
-          "audio/mp4",
-          "audio/ogg",
-        ];
-        for (const m of candidateMimes) {
-          if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
-            selectedMime = m;
-            break;
-          }
-        }
-
-        const recorder = selectedMime
-          ? new MediaRecorder(stream, { mimeType: selectedMime })
-          : new MediaRecorder(stream);
-
-        recorder.ondataavailable = (event) => {
-          if (event.data && event.data.size > 0) {
-            audioChunksRef.current.push(event.data);
-          }
-        };
-
-        recorder.start(250);
-        mediaRecorderRef.current = recorder;
-      } catch (recErr) {
-        console.warn("MediaRecorder init error:", recErr);
       }
     }
 
-    // 4. Initialize Web Speech API for real-time client-side live streaming transcription
+    // 2. Initialize Web Speech API
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -261,6 +259,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
 
         recognition.onstart = () => {
           setIsListening(true);
+          speechApiStarted = true;
         };
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {
@@ -287,33 +286,61 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
         };
 
         recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-          console.warn("SpeechRecognition event error:", event.error);
-          // Non-fatal if MediaRecorder is active
+          console.warn("SpeechRecognition error:", event.error);
           if (event.error === "not-allowed") {
-            setError("Speech recognition service permission denied.");
-          } else if (event.error === "network") {
-            console.log("Speech recognition network offline; falling back to Gemini audio model.");
+            setPermissionDenied(true);
+            setError("Microphone permission was denied by your browser.");
+          } else if (event.error === "no-speech") {
+            // normal quiet pause
+          } else {
+            setError(`Speech input issue: ${event.error}`);
           }
         };
 
         recognition.onend = () => {
-          // If stopped naturally
           setInterimTranscript("");
         };
 
         recognitionRef.current = recognition;
         recognition.start();
-      } catch (srErr) {
+        speechApiStarted = true;
+      } catch (srErr: any) {
         console.warn("SpeechRecognition start error:", srErr);
       }
     }
+
+    // Determine overall listening state
+    if (streamObtained || speechApiStarted) {
+      setIsListening(true);
+      setError(null);
+
+      // If stream failed but speech API started, run a gentle animated wave
+      if (!streamObtained && speechApiStarted) {
+        let step = 0;
+        fallbackIntervalRef.current = window.setInterval(() => {
+          step++;
+          const base = [10, 16, 24, 30, 24, 28, 16, 10];
+          const dynamicBars = base.map((b, i) =>
+            Math.max(6, Math.min(36, Math.round(b + Math.sin(step * 0.4 + i) * 8)))
+          );
+          setFrequencyBars(dynamicBars);
+          setAudioLevel(25);
+        }, 120);
+      }
+    } else {
+      setIsListening(false);
+      setPermissionDenied(true);
+      setError("Could not access microphone in this preview window. Please allow microphone access or open in a new tab.");
+    }
+
+    setIsStarting(false);
   }, [cleanup, continuous, interimResults, lang]);
 
   const stopListening = useCallback(async (): Promise<string> => {
     setIsListening(false);
+    setIsStarting(false);
     stopAudioAnalyser();
 
-    // 1. Stop SpeechRecognition
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -321,7 +348,6 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       recognitionRef.current = null;
     }
 
-    // 2. Stop MediaRecorder and grab audio blob
     let recordedBlob: Blob | null = null;
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       try {
@@ -340,16 +366,13 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       }
     }
 
-    // Release microphone hardware
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
 
-    // 3. Determine transcript
     let finalResult = accumulatedTranscriptRef.current.trim();
 
-    // If Web Speech API was empty or not supported, use server-side Gemini transcription
     if (!finalResult && recordedBlob && recordedBlob.size > 2000) {
       setIsTranscribing(true);
       try {
@@ -360,8 +383,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
           accumulatedTranscriptRef.current = finalResult;
         }
       } catch (transcribeErr: any) {
-        console.warn("Gemini audio transcription fallback error:", transcribeErr);
-        setError("Could not transcribe speech. Please try speaking again or type your command.");
+        console.warn("Gemini transcription fallback error:", transcribeErr);
       } finally {
         setIsTranscribing(false);
       }
@@ -392,6 +414,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
 
   return {
     isSupported,
+    isStarting,
     isListening,
     isTranscribing,
     transcript,

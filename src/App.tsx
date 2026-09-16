@@ -34,9 +34,7 @@ import { detectReminderRequest } from "./lib/reminderDetector";
 import { getSavedTone, saveTonePreference } from "./lib/tones";
 import {
   ShieldAlert,
-  Eye,
-  X,
-  Code
+  X
 } from "lucide-react";
 
 export default function App() {
@@ -84,13 +82,6 @@ export default function App() {
       return next;
     });
   };
-
-  // Inspector payload state for educational transparency
-  const [showInspector, setShowInspector] = useState(false);
-  const [lastPayload, setLastPayload] = useState<{
-    sentToEdge: any;
-    receivedFromEdge: any;
-  } | null>(null);
 
   // Proactive notification & follow-up message when student's break completes
   const handleBreakOver = useCallback(() => {
@@ -264,12 +255,6 @@ export default function App() {
       const response: EdgeFunctionChatResponse = await sendChatMessageToEdgeFunction(
         requestPayload
       );
-
-      // Record for payload inspector
-      setLastPayload({
-        sentToEdge: requestPayload,
-        receivedFromEdge: response,
-      });
 
       // Update rate limit remaining from server response
       if (response.rateLimit) {
@@ -475,67 +460,6 @@ export default function App() {
         onTabChange={(tab) => setActiveTab(tab)}
         onOpenVoiceModal={() => setIsVoiceModalOpen(true)}
       />
-
-      {/* Floating Payload Inspector Trigger (Bottom Right) */}
-      <div className="fixed bottom-18 right-4 z-20 hidden sm:block">
-        <button
-          id="payload-inspector-btn"
-          onClick={() => setShowInspector(!showInspector)}
-          className="px-3 py-1.5 rounded-full bg-white/90 hover:bg-white text-[#5C5049] border border-[#E2D8D0] shadow-md text-xs font-mono flex items-center gap-1.5 backdrop-blur-sm transition-transform active:scale-95"
-          title="Inspect live network payload sent to the Edge Function"
-        >
-          <Eye className="w-3.5 h-3.5 text-[#A33C1B]" />
-          <span>Edge Proxy Inspector</span>
-        </button>
-      </div>
-
-      {/* Live Payload Inspector Drawer */}
-      {showInspector && (
-        <div className="fixed inset-x-4 bottom-18 md:right-4 md:left-auto md:w-[480px] max-h-[60vh] z-40 bg-white border border-[#E2D8D0] rounded-3xl shadow-2xl p-4 flex flex-col text-xs text-[#2D2522] backdrop-blur-md">
-          <div className="flex items-center justify-between pb-2 border-b border-[#EAE2DA] mb-2">
-            <div className="flex items-center space-x-2">
-              <Code className="w-4 h-4 text-[#A33C1B]" />
-              <span className="font-bold text-[#2D2522]">
-                Live Edge Function Inspector
-              </span>
-            </div>
-            <button
-              onClick={() => setShowInspector(false)}
-              className="text-[#8A7D75] hover:text-[#2D2522]"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-
-          <p className="text-[11px] text-[#70645D] mb-2 leading-relaxed">
-            Client transmits only Maya's student snapshot & message. The Gemini API key remains server-side inside the Edge Function.
-          </p>
-
-          <div className="overflow-y-auto flex-1 space-y-3 font-mono text-[11px] bg-[#241E1C] text-stone-200 p-3 rounded-2xl border border-stone-800">
-            <div>
-              <div className="text-[#C85A32] font-bold mb-1">
-                ➔ Sent: App ➔ Supabase Edge Function
-              </div>
-              <pre className="whitespace-pre-wrap">
-                {lastPayload
-                  ? JSON.stringify(lastPayload.sentToEdge, null, 2)
-                  : "// Send a message in chat to observe the live payload"}
-              </pre>
-            </div>
-
-            {lastPayload && (
-              <div className="pt-2 border-t border-stone-800">
-                <div className="text-emerald-400 font-bold mb-1">
-                  ⬅ Returned: Edge Function ➔ App
-                </div>
-                <pre className="whitespace-pre-wrap">
-                  {JSON.stringify(lastPayload.receivedFromEdge, null, 2)}
-                </pre>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Voice Nudge Companion Modal (Image 2) */}
       <VoiceNudgeModal
